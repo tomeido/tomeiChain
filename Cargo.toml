@@ -1,0 +1,33 @@
+[package]
+name = "tomei-chain"
+version = "0.1.0"
+edition = "2021"
+description = "Ultra-lightweight Pure-Rust PoA blockchain daemon for low-power home servers"
+license = "MIT"
+
+[dependencies]
+# 비동기 런타임 (블록 생산 루프, HTTP API, 종료 시그널 처리)
+tokio = { version = "1", features = ["full"] }
+# 임베디드 KV 스토리지 — 외부 DB 없이 프로세스 내에서 블록/상태 영속화
+sled = "0.34"
+# 직렬화 프레임워크
+serde = { version = "1", features = ["derive"] }
+# sled 저장용 컴팩트 바이너리 직렬화
+bincode = "1.3"
+# HTTP API 요청/응답용 JSON 직렬화. raw_value 는 mantis 블록의
+# 바이트 보존(해시 재계산)에 필요
+serde_json = { version = "1", features = ["raw_value"] }
+# 초고속 해싱 (블록/트랜잭션/머클루트) — 저전력 CPU에서도 빠름
+blake3 = "1"
+# mantis-cad 블록 해시 호환 (sha256 — mantis-chain 의 고정 포맷)
+sha2 = "0.10"
+# mantis-cad 블록 서명 검증 (ed25519 — mantis-chain 의 고정 포맷)
+ed25519-dalek = "2"
+# 에러 타입 정의
+thiserror = "2"
+
+[profile.release]
+# 저사양 홈서버용: 바이너리 크기/메모리 최소화
+lto = true
+codegen-units = 1
+strip = true
