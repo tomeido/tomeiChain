@@ -36,8 +36,7 @@ use sha2::{Digest, Sha256};
 /// mantis-chain 의 정식 제네시스 해시 (lib.rs 테스트에 고정된 값).
 /// 이 값이 재현되지 않으면 mantis-cad 앱이 체인을 Diverged 로 거부한다.
 const GENESIS_HASH: &str = "6647ae8b4509faf6518cdfc11e2f778c856e3c0fe82a557e745f675a7cab0bee";
-const GENESIS_PREV_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 // ---------------------------------------------------------------------------
 // 블록 파싱/해싱 — mantis-chain 과 바이트 호환
@@ -91,12 +90,24 @@ impl MantisBlock {
     /// ed25519 서명 검증: author_pk(32B) 로 hash 원시 바이트에 대한 sig(64B) 확인
     fn verify_sig(&self) -> bool {
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let Some(pk_bytes) = hex_decode(&self.author_pk) else { return false };
-        let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else { return false };
-        let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else { return false };
-        let Some(sig_bytes) = hex_decode(&self.sig) else { return false };
-        let Ok(sig) = Signature::from_slice(&sig_bytes) else { return false };
-        let Some(raw_hash) = hex_decode(&self.hash) else { return false };
+        let Some(pk_bytes) = hex_decode(&self.author_pk) else {
+            return false;
+        };
+        let Ok(pk_arr) = <[u8; 32]>::try_from(pk_bytes.as_slice()) else {
+            return false;
+        };
+        let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else {
+            return false;
+        };
+        let Some(sig_bytes) = hex_decode(&self.sig) else {
+            return false;
+        };
+        let Ok(sig) = Signature::from_slice(&sig_bytes) else {
+            return false;
+        };
+        let Some(raw_hash) = hex_decode(&self.hash) else {
+            return false;
+        };
         vk.verify(&raw_hash, &sig).is_ok()
     }
 }
@@ -116,12 +127,31 @@ impl MantisBlock {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op")]
 enum MirrorOp {
-    AddNode { id: String, type_name: String, pos: (f32, f32) },
-    RemoveNode { id: String },
-    Connect { from: (String, u16), to: (String, u16) },
-    Disconnect { from: (String, u16), to: (String, u16) },
-    SetParam { id: String, key: String, value: MirrorParam },
-    MoveNode { id: String, pos: (f32, f32) },
+    AddNode {
+        id: String,
+        type_name: String,
+        pos: (f32, f32),
+    },
+    RemoveNode {
+        id: String,
+    },
+    Connect {
+        from: (String, u16),
+        to: (String, u16),
+    },
+    Disconnect {
+        from: (String, u16),
+        to: (String, u16),
+    },
+    SetParam {
+        id: String,
+        key: String,
+        value: MirrorParam,
+    },
+    MoveNode {
+        id: String,
+        pos: (f32, f32),
+    },
 }
 
 /// mantis-graph `ParamValue` 의 와이어 포맷 미러 (외부 태그드)
@@ -207,7 +237,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -254,7 +284,10 @@ pub(crate) fn init(store: &Store) -> Result<(u64, String)> {
 /// GET /api/info → {"len":N,"head":"<hex>"}
 pub(crate) async fn info(chain: &Chain) -> (u16, String) {
     let head = chain.mantis_head.lock().await.clone();
-    (200, json_body(&serde_json::json!({ "len": head.0, "head": head.1 })))
+    (
+        200,
+        json_body(&serde_json::json!({ "len": head.0, "head": head.1 })),
+    )
 }
 
 /// `/api/blocks?from=N` 쿼리 파싱 — mantis-server 와 동일하게 불량/누락 → 0
@@ -270,12 +303,77 @@ fn parse_from(query: Option<&str>) -> u64 {
 
 /// GET /api/blocks?from=N → 저장된 원본 바이트를 이어붙인 JSON 배열
 pub(crate) async fn get_blocks(chain: &Chain, query: Option<&str>) -> (u16, String) {
+    get_blocks_bounded(chain, query, crate::MAX_HTTP_REQUEST_BYTES).await
+}
+
+async fn get_blocks_bounded(
+    chain: &Chain,
+    query: Option<&str>,
+    max_response_bytes: usize,
+) -> (u16, String) {
     let len = chain.mantis_head.lock().await.0;
     let from = parse_from(query).min(len);
-    let mut parts: Vec<String> = Vec::with_capacity((len - from) as usize);
-    for index in from..len {
+    let mut limit = None;
+    for value in query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("limit="))
+    {
+        if limit.is_some() {
+            return (
+                400,
+                json_body(&serde_json::json!({"error":"duplicate limit"})),
+            );
+        }
+        match value.parse::<u64>() {
+            Ok(value) if (1..=1000).contains(&value) => limit = Some(value),
+            _ => {
+                return (
+                    400,
+                    json_body(&serde_json::json!({"error":"limit must be 1..1000"})),
+                )
+            }
+        }
+    }
+    let end = limit.map_or(len, |limit| from.saturating_add(limit).min(len));
+    let mut output = String::from("[");
+    for index in from..end {
         match chain.store.mantis_get_raw(index) {
-            Ok(Some(raw)) => parts.push(String::from_utf8_lossy(&raw).to_string()),
+            Ok(Some(raw)) => {
+                let comma = usize::from(index != from);
+                let needed = output
+                    .len()
+                    .saturating_add(raw.len())
+                    .saturating_add(comma + 1);
+                if needed > max_response_bytes {
+                    return (
+                        413,
+                        json_body(&serde_json::json!({
+                            "error":"requested Mantis history exceeds response size limit; retry with from and limit pagination",
+                            "max_response_bytes": max_response_bytes,
+                            "from": from,
+                        })),
+                    );
+                }
+                let Ok(raw) = std::str::from_utf8(&raw) else {
+                    return (
+                        500,
+                        json_body(&serde_json::json!({"error":"stored Mantis block is not UTF-8"})),
+                    );
+                };
+                if output.capacity() < needed {
+                    let capacity = output
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(needed)
+                        .min(max_response_bytes);
+                    output.reserve_exact(capacity - output.len());
+                }
+                if comma != 0 {
+                    output.push(',');
+                }
+                output.push_str(raw);
+            }
             Ok(None) => {
                 return (
                     500,
@@ -284,10 +382,16 @@ pub(crate) async fn get_blocks(chain: &Chain, query: Option<&str>) -> (u16, Stri
                     })),
                 )
             }
-            Err(e) => return (500, json_body(&serde_json::json!({ "error": e.to_string() }))),
+            Err(e) => {
+                return (
+                    500,
+                    json_body(&serde_json::json!({ "error": e.to_string() })),
+                )
+            }
         }
     }
-    (200, format!("[{}]", parts.join(",")))
+    output.push(']');
+    (200, output)
 }
 
 /// POST /api/blocks → fast-forward 병합 (mantis-chain `try_extend` 의 의미론)
@@ -312,7 +416,10 @@ pub(crate) async fn post_blocks(chain: &Chain, body: &[u8]) -> (u16, String) {
     let mut head = chain.mantis_head.lock().await;
     let (cur_len, cur_head_hash) = head.clone();
     let conflict = |head: &(u64, String)| {
-        (409, json_body(&serde_json::json!({ "len": head.0, "head": head.1 })))
+        (
+            409,
+            json_body(&serde_json::json!({ "len": head.0, "head": head.1 })),
+        )
     };
 
     // (index, hash, author, 원본 JSON) — 커밋 대기 목록
@@ -328,8 +435,10 @@ pub(crate) async fn post_blocks(chain: &Chain, body: &[u8]) -> (u16, String) {
             }
         };
         let head_index = cur_len - 1 + appended.len() as u64;
-        let head_hash =
-            appended.last().map(|(_, h, _, _)| h.clone()).unwrap_or_else(|| cur_head_hash.clone());
+        let head_hash = appended
+            .last()
+            .map(|(_, h, _, _)| h.clone())
+            .unwrap_or_else(|| cur_head_hash.clone());
 
         if block.index <= head_index {
             // 이미 아는 영역: (index, hash) 가 정확히 일치해야 한다 — 다르면 포크
@@ -361,17 +470,33 @@ pub(crate) async fn post_blocks(chain: &Chain, body: &[u8]) -> (u16, String) {
         {
             return conflict(&head);
         }
-        appended.push((block.index, block.hash.clone(), block.author.clone(), raw.get().to_string()));
+        appended.push((
+            block.index,
+            block.hash.clone(),
+            block.author.clone(),
+            raw.get().to_string(),
+        ));
     }
 
     let final_len;
     if !appended.is_empty() {
         let new_len = cur_len + appended.len() as u64;
-        let new_head_hash = appended.last().map(|(_, h, _, _)| h.clone()).unwrap_or_default();
-        let to_store: Vec<(u64, String)> =
-            appended.iter().map(|(i, _, _, raw)| (*i, raw.clone())).collect();
-        if let Err(e) = chain.store.mantis_commit(&to_store, new_len, &new_head_hash) {
-            return (500, json_body(&serde_json::json!({ "error": e.to_string() })));
+        let new_head_hash = appended
+            .last()
+            .map(|(_, h, _, _)| h.clone())
+            .unwrap_or_default();
+        let to_store: Vec<(u64, String)> = appended
+            .iter()
+            .map(|(i, _, _, raw)| (*i, raw.clone()))
+            .collect();
+        if let Err(e) = chain
+            .store
+            .mantis_commit(&to_store, new_len, &new_head_hash)
+        {
+            return (
+                500,
+                json_body(&serde_json::json!({ "error": e.to_string() })),
+            );
         }
         *head = (new_len, new_head_hash.clone());
         final_len = new_len;
@@ -390,8 +515,9 @@ pub(crate) async fn post_blocks(chain: &Chain, body: &[u8]) -> (u16, String) {
                 "author": author,
             })
             .to_string();
-            if let Err(e) =
-                chain.submit_tx("mantis-cad".to_string(), anchor, None, Vec::new()).await
+            if let Err(e) = chain
+                .submit_tx("mantis-cad".to_string(), anchor, None, Vec::new())
+                .await
             {
                 crate::log_line(&format!("mantis 앵커 기록 실패(무시): {e}"));
             }
@@ -428,12 +554,7 @@ mod tests {
     }
 
     /// 테스트용 서명 블록 생성기 — mantis-chain 의 append 와 동일한 절차
-    fn signed_block(
-        key: &SigningKey,
-        index: u64,
-        prev_hash: &str,
-        ops_json: &[&str],
-    ) -> String {
+    fn signed_block(key: &SigningKey, index: u64, prev_hash: &str, ops_json: &[&str]) -> String {
         let ops: Vec<Box<RawValue>> = ops_json
             .iter()
             .map(|s| RawValue::from_string(s.to_string()).unwrap())
@@ -455,15 +576,42 @@ mod tests {
         serde_json::to_string(&block).unwrap()
     }
 
-    const OP_ADD: &str =
-        r#"{"op":"AddNode","id":"000102030405060708090a0b0c0d0e0f","type_name":"circle","pos":[120.0,80.0]}"#;
+    const OP_ADD: &str = r#"{"op":"AddNode","id":"000102030405060708090a0b0c0d0e0f","type_name":"circle","pos":[120.0,80.0]}"#;
+
+    #[tokio::test]
+    async fn oversized_history_is_explicit_and_pagination_preserves_original_bytes() {
+        let (chain, dir) = crate::tests::test_chain();
+        let raw = signed_block(
+            &SigningKey::from_bytes(&[13u8; 32]),
+            1,
+            GENESIS_HASH,
+            &[OP_ADD],
+        );
+        assert_eq!(
+            post_blocks(&chain, format!("[{raw}]").as_bytes()).await.0,
+            200
+        );
+        let budget = raw.len() + 2;
+        let (code, error) = get_blocks_bounded(&chain, None, budget).await;
+        assert_eq!(code, 413);
+        assert!(error.contains("pagination"));
+        let (code, page) = get_blocks_bounded(&chain, Some("from=1&limit=1"), budget).await;
+        assert_eq!(code, 200);
+        assert_eq!(page, format!("[{raw}]"));
+        assert_eq!(get_blocks(&chain, Some("limit=0")).await.0, 400);
+        assert_eq!(get_blocks(&chain, Some("limit=1&limit=2")).await.0, 400);
+        drop(chain);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn op_검증은_비정상_op_를_거부하고_정상_op_를_통과시킨다() {
         let ok = |s: &str| validate_op(&RawValue::from_string(s.to_string()).unwrap());
         // 정상 op 들 (컴팩트 serde_json 출력 형태)
         assert!(ok(OP_ADD));
-        assert!(ok(r#"{"op":"RemoveNode","id":"000102030405060708090a0b0c0d0e0f"}"#));
+        assert!(ok(
+            r#"{"op":"RemoveNode","id":"000102030405060708090a0b0c0d0e0f"}"#
+        ));
         assert!(ok(
             r#"{"op":"Connect","from":["000102030405060708090a0b0c0d0e0f",0],"to":["0f0102030405060708090a0b0c0d0e0f",1]}"#
         ));
@@ -471,13 +619,19 @@ mod tests {
             r#"{"op":"SetParam","id":"000102030405060708090a0b0c0d0e0f","key":"value","value":{"Number":3.5}}"#
         ));
         // 비정상: 알 수 없는 op 태그 → GraphOp 파싱 불가 → 체인 포이즈닝 차단
-        assert!(!ok(r#"{"op":"DropTable","id":"000102030405060708090a0b0c0d0e0f"}"#));
+        assert!(!ok(
+            r#"{"op":"DropTable","id":"000102030405060708090a0b0c0d0e0f"}"#
+        ));
         // 비정상: NodeId 가 32-hex 가 아님
         assert!(!ok(r#"{"op":"RemoveNode","id":"zz"}"#));
         // 비정상: 필수 필드 누락
-        assert!(!ok(r#"{"op":"AddNode","id":"000102030405060708090a0b0c0d0e0f"}"#));
+        assert!(!ok(
+            r#"{"op":"AddNode","id":"000102030405060708090a0b0c0d0e0f"}"#
+        ));
         // 비정상: 캐노니컬 인코딩 아님 (공백) — 클라이언트 해시 재계산이 깨질 형태
-        assert!(!ok(r#"{"op": "RemoveNode", "id": "000102030405060708090a0b0c0d0e0f"}"#));
+        assert!(!ok(
+            r#"{"op": "RemoveNode", "id": "000102030405060708090a0b0c0d0e0f"}"#
+        ));
     }
 
     #[tokio::test]
@@ -485,9 +639,12 @@ mod tests {
         let (chain, dir) = crate::tests::test_chain();
         let key = SigningKey::from_bytes(&[9u8; 32]);
         // 서명·해시는 유효하지만 op 가 GraphOp 로 파싱 불가능한 블록
-        let poison = signed_block(&key, 1, GENESIS_HASH, &[
-            r#"{"op":"NotARealOp","id":"000102030405060708090a0b0c0d0e0f"}"#,
-        ]);
+        let poison = signed_block(
+            &key,
+            1,
+            GENESIS_HASH,
+            &[r#"{"op":"NotARealOp","id":"000102030405060708090a0b0c0d0e0f"}"#],
+        );
         let (code, _) = post_blocks(&chain, format!("[{poison}]").as_bytes()).await;
         assert_eq!(code, 409);
         // 체인은 오염되지 않았다
@@ -532,9 +689,12 @@ mod tests {
         assert_eq!(v["appended"], 0);
 
         // 3) 포크 블록 (같은 index, 다른 내용) → 409 + 헤드 정보
-        let fork = signed_block(&key, 1, GENESIS_HASH, &[
-            r#"{"op":"RemoveNode","id":"000102030405060708090a0b0c0d0e0f"}"#,
-        ]);
+        let fork = signed_block(
+            &key,
+            1,
+            GENESIS_HASH,
+            &[r#"{"op":"RemoveNode","id":"000102030405060708090a0b0c0d0e0f"}"#],
+        );
         let (code, resp) = post_blocks(&chain, format!("[{fork}]").as_bytes()).await;
         assert_eq!(code, 409);
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -542,13 +702,8 @@ mod tests {
 
         // 4) 서명이 깨진 블록 → 409
         let b1_parsed: MantisBlock = serde_json::from_str(&b1).unwrap();
-        let mut b2: MantisBlock = serde_json::from_str(&signed_block(
-            &key,
-            2,
-            &b1_parsed.hash,
-            &[OP_ADD],
-        ))
-        .unwrap();
+        let mut b2: MantisBlock =
+            serde_json::from_str(&signed_block(&key, 2, &b1_parsed.hash, &[OP_ADD])).unwrap();
         b2.sig = "00".repeat(64);
         let bad_body = format!("[{}]", serde_json::to_string(&b2).unwrap());
         let (code, _) = post_blocks(&chain, bad_body.as_bytes()).await;

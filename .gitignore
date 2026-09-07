@@ -1,3 +1,10 @@
 /target
 /tomei-data
 demo-chain.json
+/.env
+/.env.*
+!/.env.example
+!/.env.authority.example
+*.key
+/backups
+__pycache__/

@@ -1,0 +1,24 @@
+[Unit]
+Description=tomeiChain verified follower
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tomeiChain
+Environment=TOMEI_NODE_ROLE=follower
+Environment=TOMEI_ADDR=127.0.0.1:8642
+Environment=TOMEI_MANTIS_ADDR=off
+Environment=TOMEI_DATA_DIR=%h/.local/share/tomei-chain
+EnvironmentFile=%h/.config/tomei-chain/node.env
+ExecStart=%h/tomeiChain/target/release/tomei-chain
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target

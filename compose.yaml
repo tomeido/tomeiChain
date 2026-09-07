@@ -1,0 +1,41 @@
+services:
+  node:
+    image: tomei-chain:local
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    environment:
+      TOMEI_NODE_ROLE: ${TOMEI_NODE_ROLE:-follower}
+      TOMEI_DATA_DIR: /var/lib/tomei-chain
+      TOMEI_ADDR: 0.0.0.0:8642
+      TOMEI_MANTIS_ADDR: "off"
+      TOMEI_PUBLIC_URL: ${TOMEI_PUBLIC_URL:-http://127.0.0.1:8642}
+      TOMEI_AUTHORITY_PUBLIC_KEY: ${TOMEI_AUTHORITY_PUBLIC_KEY:-}
+      TOMEI_CHAIN_ID: ${TOMEI_CHAIN_ID:-}
+      TOMEI_PEERS: ${TOMEI_PEERS:-}
+      TOMEI_SYNC_INTERVAL_MS: ${TOMEI_SYNC_INTERVAL_MS:-2000}
+      TOMEI_WRITE_TOKEN: ${TOMEI_WRITE_TOKEN:-}
+      TOMEI_BLOCK_INTERVAL_MS: ${TOMEI_BLOCK_INTERVAL_MS:-2000}
+      TOMEI_BATCH: ${TOMEI_BATCH:-100}
+    ports:
+      - "${TOMEI_BIND_IP:-127.0.0.1}:${TOMEI_PORT:-8642}:8642"
+    volumes:
+      - node-data:/var/lib/tomei-chain
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  node-data:

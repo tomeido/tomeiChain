@@ -18,6 +18,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 CMD="${1:-release}"
+TOMEI_RUST_IMAGE="${TOMEI_RUST_IMAGE:-rust:1.96.1-bookworm}"
 
 CARGO_SCRATCH="${TMPDIR:-/tmp}/tomei-cargo-home-$(id -u)"
 mkdir -p "$CARGO_SCRATCH"
@@ -30,13 +31,13 @@ run() {
     -v "$CARGO_SCRATCH":/cargo \
     -v "$HOME/.cargo/registry":/cargo/registry \
     -v "$PWD":/work -w /work \
-    rust:1 "$@"
+    "$TOMEI_RUST_IMAGE" "$@"
 }
 
 case "$CMD" in
-  release) run cargo build --release ;;
-  build)   run cargo build ;;
-  test)    run cargo test "${@:2}" ;;
-  clippy)  run cargo clippy --all-targets "${@:2}" ;;
+  release) run cargo build --release --locked ;;
+  build)   run cargo build --locked ;;
+  test)    run cargo test --locked "${@:2}" ;;
+  clippy)  run cargo clippy --locked --all-targets "${@:2}" ;;
   *)       run "$@" ;;
 esac

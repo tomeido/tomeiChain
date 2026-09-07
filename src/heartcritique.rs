@@ -55,7 +55,10 @@ pub(crate) async fn upload(chain: &Chain, body: &[u8]) -> (u16, String) {
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
-            return (400, json_body(&serde_json::json!({ "error": format!("잘못된 JSON: {e}") })))
+            return (
+                400,
+                json_body(&serde_json::json!({ "error": format!("잘못된 JSON: {e}") })),
+            )
         }
     };
     let payload_ok = match parsed.get("payload") {
@@ -66,7 +69,10 @@ pub(crate) async fn upload(chain: &Chain, body: &[u8]) -> (u16, String) {
         Some(_) => true,
     };
     if !payload_ok {
-        return (400, json_body(&serde_json::json!({ "error": "payload 필드가 필요합니다" })));
+        return (
+            400,
+            json_body(&serde_json::json!({ "error": "payload 필드가 필요합니다" })),
+        );
     }
 
     // 2) Story-Id 추출 (문자열/숫자 모두 수용 — JS 의 String(...) 과 동일 의미)
@@ -82,7 +88,10 @@ pub(crate) async fn upload(chain: &Chain, body: &[u8]) -> (u16, String) {
     let raw = match String::from_utf8(body.to_vec()) {
         Ok(s) => s,
         Err(_) => {
-            return (400, json_body(&serde_json::json!({ "error": "UTF-8 이 아닌 바디" })))
+            return (
+                400,
+                json_body(&serde_json::json!({ "error": "UTF-8 이 아닌 바디" })),
+            )
         }
     };
     let tags = if story_id.is_empty() {
@@ -90,7 +99,10 @@ pub(crate) async fn upload(chain: &Chain, body: &[u8]) -> (u16, String) {
     } else {
         vec![(STORY_TAG.to_string(), story_id)]
     };
-    match chain.submit_tx(NAMESPACE.to_string(), raw, None, tags).await {
+    match chain
+        .submit_tx(NAMESPACE.to_string(), raw, None, tags)
+        .await
+    {
         Ok((id, SubmitOutcome::PoolFull)) => (
             503,
             json_body(&serde_json::json!({
@@ -120,10 +132,7 @@ pub(crate) async fn upload(chain: &Chain, body: &[u8]) -> (u16, String) {
                             })),
                         );
                     }
-                    crate::log_line(&format!(
-                        "박제 완료 — tx {}… (블록 #{height})",
-                        &id[..16]
-                    ));
+                    crate::log_line(&format!("박제 완료 — tx {}… (블록 #{height})", &id[..16]));
                     ok_response(chain, &id, deduped)
                 }
                 // 커밋을 확인하지 못했으면 성공을 주장하지 않는다 — Python 쪽
@@ -137,7 +146,10 @@ pub(crate) async fn upload(chain: &Chain, body: &[u8]) -> (u16, String) {
                 ),
             }
         }
-        Err(e) => (400, json_body(&serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => (
+            400,
+            json_body(&serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -153,19 +165,26 @@ pub(crate) async fn bundle(chain: &Chain, tx_id: &str) -> (u16, String) {
                     return (200, tx.payload.clone());
                 }
             }
-            (500, json_body(&serde_json::json!({ "error": "인덱스는 있으나 블록 조회 실패" })))
+            (
+                500,
+                json_body(&serde_json::json!({ "error": "인덱스는 있으나 블록 조회 실패" })),
+            )
         }
         Ok(None) => {
             // 2) 아직 멤풀 대기 중(큐 또는 밀봉 창)인 트랜잭션
             let pool = chain.mempool.lock().await;
             match pool.find(tx_id) {
                 Some(tx) => (200, tx.payload.clone()),
-                None => {
-                    (404, json_body(&serde_json::json!({ "error": "존재하지 않는 트랜잭션" })))
-                }
+                None => (
+                    404,
+                    json_body(&serde_json::json!({ "error": "존재하지 않는 트랜잭션" })),
+                ),
             }
         }
-        Err(e) => (500, json_body(&serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => (
+            500,
+            json_body(&serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -222,7 +241,10 @@ mod tests {
         assert_eq!(code, 200, "{resp}");
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let tx_id = v["txId"].as_str().unwrap().to_string();
-        assert!(v["arweaveUrl"].as_str().unwrap().ends_with(&format!("/bundle/{tx_id}")));
+        assert!(v["arweaveUrl"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/bundle/{tx_id}")));
         assert_eq!(v["permanent"], true);
         assert!(v.get("deduped").is_none());
 

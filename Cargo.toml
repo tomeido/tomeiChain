@@ -1,8 +1,8 @@
 [package]
 name = "tomei-chain"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Ultra-lightweight Pure-Rust PoA blockchain daemon for low-power home servers"
+description = "Lightweight Rust data chain with signed, independently operated replica nodes"
 license = "MIT"
 
 [dependencies]
@@ -23,6 +23,9 @@ blake3 = "1"
 sha2 = "0.10"
 # mantis-cad 블록 서명 검증 (ed25519 — mantis-chain 의 고정 포맷)
 ed25519-dalek = "2"
+# HTTPS peer synchronization and OS randomness for node authority keys.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+getrandom = "0.2"
 # 에러 타입 정의
 thiserror = "2"
 

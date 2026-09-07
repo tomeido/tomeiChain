@@ -24,7 +24,11 @@
 //!   [9] HTTP API    [10] 데모         [11] main         [12] 테스트
 
 mod heartcritique;
+mod http;
 mod mantis;
+mod network;
+#[cfg(test)]
+mod regression_tests;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -32,7 +36,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex, Notify, Semaphore};
 
@@ -57,6 +61,8 @@ struct Config {
     block_interval: Duration,
     /// 멤풀에 이 개수 이상 쌓이면 주기를 기다리지 않고 즉시 블록 생산 (TOMEI_BATCH)
     batch_threshold: usize,
+    network: network::NetworkConfig,
+    write_token: Option<String>,
 }
 
 /// 블록 하나에 담는 최대 트랜잭션 수 — 블록 크기(메모리) 상한
@@ -65,6 +71,8 @@ const MAX_BLOCK_TXS: usize = 500;
 const MAX_BLOCK_BYTES: usize = 8 * 1024 * 1024;
 /// 멤풀 최대 크기 — 초과 제출은 거부하여 메모리 사용량을 유계로 유지
 const MAX_MEMPOOL: usize = 10_000;
+const MAX_MEMPOOL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_METADATA_BYTES: usize = 16 * 1024;
 /// 트랜잭션 페이로드 최대 크기 (8 MiB — HeartCritique 박제 번들 수용)
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 /// 네임스페이스 최대 길이
@@ -79,31 +87,52 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 const SLED_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
 impl Config {
-    fn from_env() -> Self {
+    fn from_env() -> Result<Self> {
         let data_dir =
             std::env::var("TOMEI_DATA_DIR").unwrap_or_else(|_| "./tomei-data".to_string());
         let api_addr: SocketAddr = std::env::var("TOMEI_ADDR")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| "127.0.0.1:8642".parse().expect("기본 주소는 항상 유효"));
+            .unwrap_or_else(|_| "127.0.0.1:8642".into())
+            .parse()
+            .map_err(|_| ChainError::InvalidTx("invalid TOMEI_ADDR".into()))?;
         let mantis_addr = match std::env::var("TOMEI_MANTIS_ADDR") {
             Ok(s) if s.eq_ignore_ascii_case("off") => None,
-            Ok(s) => s.parse().ok(),
+            Ok(s) => Some(
+                s.parse()
+                    .map_err(|_| ChainError::InvalidTx("invalid TOMEI_MANTIS_ADDR".into()))?,
+            ),
             Err(_) => Some("127.0.0.1:7878".parse().expect("기본 주소는 항상 유효")),
         };
-        let public_url = std::env::var("TOMEI_PUBLIC_URL")
-            .unwrap_or_else(|_| format!("http://{api_addr}"));
-        let block_interval = Duration::from_millis(
-            std::env::var("TOMEI_BLOCK_INTERVAL_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2_000),
-        );
-        let batch_threshold = std::env::var("TOMEI_BATCH")
+        let public_url =
+            std::env::var("TOMEI_PUBLIC_URL").unwrap_or_else(|_| format!("http://{api_addr}"));
+        let block_interval = Duration::from_millis(env_positive("TOMEI_BLOCK_INTERVAL_MS", 2_000)?);
+        let batch_threshold = usize::try_from(env_positive("TOMEI_BATCH", 100)?)
+            .map_err(|_| ChainError::InvalidTx("invalid TOMEI_BATCH".into()))?;
+        let network = network::NetworkConfig::from_env(&data_dir)?;
+        let write_token = std::env::var("TOMEI_WRITE_TOKEN")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
-        Config { data_dir, api_addr, mantis_addr, public_url, block_interval, batch_threshold }
+            .filter(|v| !v.is_empty());
+        Ok(Config {
+            data_dir,
+            api_addr,
+            mantis_addr,
+            public_url,
+            block_interval,
+            batch_threshold,
+            network,
+            write_token,
+        })
+    }
+}
+
+fn env_positive(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| ChainError::InvalidTx(format!("{name} must be a positive integer"))),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(_) => Err(ChainError::InvalidTx(format!("invalid {name}"))),
     }
 }
 
@@ -142,7 +171,7 @@ pub(crate) type Result<T> = std::result::Result<T, ChainError>;
 /// - `namespace`: 제출한 애플리케이션 식별자 (예: "heartcritique-eas", "mantis-cad")
 /// - `payload`  : 임의 데이터 — 파일 해시, JSON 메타데이터 문자열 등
 /// - `tags`     : 월드 스테이트에 인덱싱되는 (키,값) 쌍. 같은 태그의 최초
-///                트랜잭션이 승자(first-wins)가 되어 멱등 제출을 지원한다.
+///   트랜잭션이 승자(first-wins)가 되어 멱등 제출을 지원한다.
 /// - `signature`: PoA 확장을 위한 자리. 현재는 구조만 두고 검증하지 않는다.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub(crate) struct Transaction {
@@ -177,14 +206,47 @@ impl Transaction {
                 "payload 가 최대 크기({MAX_PAYLOAD_BYTES} 바이트)를 초과했습니다"
             )));
         }
+        let metadata_bytes = tags.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+            + signature.as_ref().map_or(0, String::len);
+        if namespace.contains('\0')
+            || tags.len() > 64
+            || metadata_bytes > MAX_METADATA_BYTES
+            || tags
+                .iter()
+                .any(|(k, v)| k.contains('\0') || v.contains('\0'))
+        {
+            return Err(ChainError::InvalidTx(
+                "invalid namespace/tags or metadata exceeds 16 KiB / 64 tags".into(),
+            ));
+        }
         let timestamp = now_millis();
         let id = compute_tx_id(&namespace, &payload, timestamp, &tags);
-        Ok(Transaction { id, namespace, payload, timestamp, tags, signature })
+        Ok(Transaction {
+            id,
+            namespace,
+            payload,
+            timestamp,
+            tags,
+            signature,
+        })
     }
 
     /// 저장된 트랜잭션의 ID가 실제 내용과 일치하는지 재계산으로 검증한다.
     fn verify_id(&self) -> bool {
         self.id == compute_tx_id(&self.namespace, &self.payload, self.timestamp, &self.tags)
+    }
+
+    fn memory_size(&self) -> usize {
+        self.payload.len()
+            + self.namespace.len()
+            + self.id.len()
+            + self.signature.as_ref().map_or(0, String::len)
+            + self
+                .tags
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 48)
+                .sum::<usize>()
+            + 128
     }
 }
 
@@ -230,7 +292,11 @@ impl Block {
             timestamp,
         };
         let hash = compute_block_hash(&header)?;
-        Ok(Block { header, transactions, hash })
+        Ok(Block {
+            header,
+            transactions,
+            hash,
+        })
     }
 
     /// 모든 노드가 동일하게 재현할 수 있는 결정적(deterministic) 제네시스 블록.
@@ -341,10 +407,14 @@ fn compute_block_hash(header: &BlockHeader) -> Result<String> {
 /// 홀수 레벨은 마지막 노드를 복제해 짝을 맞춘다 (비트코인 방식).
 fn merkle_root(tx_ids: &[&str]) -> String {
     if tx_ids.is_empty() {
-        return blake3::hash(b"tomei-chain/empty-block").to_hex().to_string();
+        return blake3::hash(b"tomei-chain/empty-block")
+            .to_hex()
+            .to_string();
     }
-    let mut level: Vec<blake3::Hash> =
-        tx_ids.iter().map(|id| blake3::hash(id.as_bytes())).collect();
+    let mut level: Vec<blake3::Hash> = tx_ids
+        .iter()
+        .map(|id| blake3::hash(id.as_bytes()))
+        .collect();
     while level.len() > 1 {
         if level.len() % 2 == 1 {
             level.push(*level.last().expect("비어있지 않음"));
@@ -378,10 +448,12 @@ fn merkle_root(tx_ids: &[&str]) -> String {
 //   mantis_blocks : mantis-cad 블록 원본 JSON.  key = index(u64 BE) → raw bytes
 //                   (수신 바이트 그대로 보존 — 해시/서명 재검증 가능)
 
+#[derive(Clone)]
 pub(crate) struct Store {
     db: sled::Db,
     blocks: sled::Tree,
     state: sled::Tree,
+    signatures: sled::Tree,
     pub(crate) mantis_blocks: sled::Tree,
 }
 
@@ -407,7 +479,14 @@ impl Store {
         let blocks = db.open_tree("blocks")?;
         let state = db.open_tree("state")?;
         let mantis_blocks = db.open_tree("mantis_blocks")?;
-        Ok(Store { db, blocks, state, mantis_blocks })
+        let signatures = db.open_tree("network_signatures")?;
+        Ok(Store {
+            db,
+            blocks,
+            state,
+            mantis_blocks,
+            signatures,
+        })
     }
 
     /// 초기화/복원 로직:
@@ -449,6 +528,15 @@ impl Store {
     /// 블록과 갱신된 상태를 **하나의 원자적 sled 트랜잭션**으로 커밋한다.
     /// (blocks 트리와 state 트리에 동시에 반영 — 중간 크래시에도 일관성 유지)
     fn commit_block(&self, block: &Block, new_state: &BlockchainState) -> Result<()> {
+        self.commit_attested(block, new_state, None)
+    }
+
+    fn commit_attested(
+        &self,
+        block: &Block,
+        new_state: &BlockchainState,
+        signature: Option<&str>,
+    ) -> Result<()> {
         use sled::transaction::TransactionError;
         use sled::Transactional;
 
@@ -495,9 +583,12 @@ impl Store {
             }
         }
 
-        (&self.blocks, &self.state)
-            .transaction(|(blocks_tx, state_tx)| {
+        (&self.blocks, &self.state, &self.signatures)
+            .transaction(|(blocks_tx, state_tx, signatures_tx)| {
                 blocks_tx.insert(&height_be, block_bytes.as_slice())?;
+                if let Some(signature) = signature {
+                    signatures_tx.insert(&height_be, signature.as_bytes())?;
+                }
                 state_tx.insert(b"chain_state", state_bytes.as_slice())?;
                 for (key, height) in &tx_index {
                     state_tx.insert(key.as_slice(), &height[..])?;
@@ -627,6 +718,17 @@ impl Store {
                     })
                 }
             };
+            if block.header.index != h || (h == 0 && block != Block::genesis()?) {
+                return Ok(VerifyReport {
+                    ok: false,
+                    checked_blocks: checked,
+                    from,
+                    to,
+                    error: Some(format!(
+                        "noncanonical genesis or incorrect block index at {h}"
+                    )),
+                });
+            }
             if let Err(e) = block.verify_integrity() {
                 return Ok(VerifyReport {
                     ok: false,
@@ -650,7 +752,13 @@ impl Store {
             prev_hash = Some(block.hash);
             checked += 1;
         }
-        Ok(VerifyReport { ok: true, checked_blocks: checked, from, to, error: None })
+        Ok(VerifyReport {
+            ok: true,
+            checked_blocks: checked,
+            from,
+            to,
+            error: None,
+        })
     }
 }
 
@@ -669,6 +777,7 @@ pub(crate) struct Mempool {
     /// 현재 블록으로 밀봉(커밋) 진행 중인 트랜잭션 — 드레인~커밋 사이에도
     /// GET /tx, GET /bundle 조회가 끊기지 않게 하는 가시성 창
     pub sealing: Vec<Transaction>,
+    bytes: usize,
 }
 
 impl Mempool {
@@ -682,7 +791,9 @@ impl Mempool {
 
     /// 커밋이 확정된 트랜잭션의 흔적(ID/태그 클레임)을 정리한다.
     fn forget(&mut self, tx: &Transaction) {
-        self.ids.remove(&tx.id);
+        if self.ids.remove(&tx.id) {
+            self.bytes = self.bytes.saturating_sub(tx.memory_size());
+        }
         for tag in &tx.tags {
             // 태그는 이 트랜잭션이 클레임 소유자일 때만 제거 (다른 대기 tx 보호)
             if self.pending_tags.get(tag) == Some(&tx.id) {
@@ -722,6 +833,10 @@ pub(crate) struct Chain {
     pub mantis_head: Mutex<(u64, String)>,
     /// /upload 응답의 번들 URL 생성용 외부 접근 베이스 URL
     pub public_url: String,
+    pub network: network::Network,
+    write_token: Option<String>,
+    seal_lock: Mutex<()>,
+    verify_gate: Arc<Semaphore>,
 }
 
 impl Chain {
@@ -729,6 +844,11 @@ impl Chain {
     fn bootstrap(config: &Config) -> Result<(Arc<Self>, bool)> {
         let store = Store::open(&config.data_dir)?;
         let (state, resumed) = store.init_or_resume()?;
+        let report = store.verify_chain(0, state.height)?;
+        if !report.ok {
+            return Err(ChainError::Integrity(report.error.unwrap_or_default()));
+        }
+        let network = network::Network::open(&store, &config.network)?;
         let mantis_head = mantis::init(&store)?;
         let chain = Arc::new(Chain {
             store,
@@ -738,6 +858,10 @@ impl Chain {
             batch_threshold: config.batch_threshold,
             mantis_head: Mutex::new(mantis_head),
             public_url: config.public_url.trim_end_matches('/').to_string(),
+            network,
+            write_token: config.write_token.clone(),
+            seal_lock: Mutex::new(()),
+            verify_gate: Arc::new(Semaphore::new(1)),
         });
         Ok((chain, resumed))
     }
@@ -750,6 +874,11 @@ impl Chain {
         signature: Option<String>,
         tags: Vec<(String, String)>,
     ) -> Result<(String, SubmitOutcome)> {
+        if self.network.config.role == network::Role::Follower {
+            return Err(ChainError::InvalidTx(
+                "follower nodes do not accept writes".into(),
+            ));
+        }
         let tx = Transaction::new(namespace, payload, signature, tags)?;
         let id = tx.id.clone();
 
@@ -775,10 +904,13 @@ impl Chain {
                 return Ok((existing, SubmitOutcome::AlreadyCommitted { height }));
             }
         }
-        if pool.queue.len() >= MAX_MEMPOOL {
+        if pool.ids.len() >= MAX_MEMPOOL
+            || pool.bytes.saturating_add(tx.memory_size()) > MAX_MEMPOOL_BYTES
+        {
             return Ok((id, SubmitOutcome::PoolFull));
         }
         pool.ids.insert(id.clone());
+        pool.bytes += tx.memory_size();
         for tag in &tx.tags {
             pool.pending_tags.insert(tag.clone(), id.clone());
         }
@@ -799,6 +931,10 @@ impl Chain {
     /// 드레인된 트랜잭션은 커밋이 확정될 때까지 `sealing` 창과 `ids`/`pending_tags`
     /// 에 남아 있어, 밀봉 중에도 조회(GET /tx, /bundle)와 멱등 제출이 끊기지 않는다.
     pub(crate) async fn seal_pending_block(&self) -> Result<Option<Block>> {
+        if self.network.config.role == network::Role::Follower {
+            return Ok(None);
+        }
+        let _seal_guard = self.seal_lock.lock().await;
         // 1) 멤풀에서 개수/바이트 상한까지 드레인 → 밀봉 창으로 이동
         let mut txs: Vec<Transaction> = {
             let mut pool = self.mempool.lock().await;
@@ -808,7 +944,7 @@ impl Chain {
                 if drained.len() >= MAX_BLOCK_TXS {
                     break;
                 }
-                let size = front.payload.len();
+                let size = front.memory_size();
                 if !drained.is_empty() && bytes + size > MAX_BLOCK_BYTES {
                     break;
                 }
@@ -870,7 +1006,14 @@ impl Chain {
             tip_hash: block.hash.clone(),
             total_txs: state.total_txs + block.transactions.len() as u64,
         };
-        if let Err(e) = self.store.commit_block(&block, &new_state) {
+        let commit = self
+            .network
+            .signature_for_commit(&block)
+            .and_then(|signature| {
+                self.store
+                    .commit_attested(&block, &new_state, signature.as_deref())
+            });
+        if let Err(e) = commit {
             restore(&mut *self.mempool.lock().await);
             return Err(e);
         }
@@ -889,6 +1032,60 @@ impl Chain {
             log_line(&format!("경고: flush 실패 (데이터는 커밋됨): {e}"));
         }
         Ok(Some(block))
+    }
+
+    pub(crate) async fn append_replica(&self, signed: network::SignedBlock) -> Result<()> {
+        if self.network.config.role != network::Role::Follower {
+            return Err(ChainError::Integrity(
+                "authority cannot import peer blocks".into(),
+            ));
+        }
+        self.network.verify(&signed)?;
+        let block = &signed.block;
+        let signature = network::checkpoint_json(&signed.checkpoint)?;
+        let mut state = self.state.lock().await;
+        if block.header.index <= state.height {
+            let existing = self.store.get_block(block.header.index)?;
+            if existing.as_ref() != Some(block) {
+                return Err(ChainError::Integrity(
+                    "peer fork conflicts with stored block".into(),
+                ));
+            }
+            let key = block.header.index.to_be_bytes();
+            if self.store.signatures.get(key)?.as_deref() != Some(signature.as_bytes()) {
+                self.store.signatures.insert(key, signature.as_bytes())?;
+                self.store.flush().await?;
+            }
+            return Ok(());
+        }
+        if state.height.checked_add(1) != Some(block.header.index)
+            || block.header.prev_block_hash != state.tip_hash
+        {
+            return Err(ChainError::Integrity(
+                "noncontiguous peer block or fork".into(),
+            ));
+        }
+        let mut ids = HashSet::new();
+        for tx in &block.transactions {
+            if !ids.insert(&tx.id) || self.store.tx_height(&tx.id)?.is_some() {
+                return Err(ChainError::Integrity(
+                    "duplicate transaction in peer chain".into(),
+                ));
+            }
+        }
+        let new_state = BlockchainState {
+            height: block.header.index,
+            tip_hash: block.hash.clone(),
+            total_txs: state
+                .total_txs
+                .checked_add(block.transactions.len() as u64)
+                .ok_or_else(|| ChainError::Integrity("transaction count overflow".into()))?,
+        };
+        self.store
+            .commit_attested(block, &new_state, Some(&signature))?;
+        *state = new_state;
+        self.store.flush().await?;
+        Ok(())
     }
 
     pub(crate) async fn snapshot(&self) -> (BlockchainState, usize) {
@@ -1019,9 +1216,11 @@ struct SubmitTxRequest {
 async fn api_server(chain: Arc<Chain>, listener: TcpListener, mut shutdown: watch::Receiver<bool>) {
     // 동시 커넥션 유계화 — 포화 시 새 커넥션은 즉시 끊어 자원 고갈을 막는다
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut requests = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
+            _ = requests.join_next(), if !requests.is_empty() => {},
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(pair) => pair,
@@ -1036,7 +1235,7 @@ async fn api_server(chain: Arc<Chain>, listener: TcpListener, mut shutdown: watc
                 };
                 let chain = Arc::clone(&chain);
                 // 커넥션당 태스크 — 처리 중 오류/시간 초과는 해당 커넥션만 종료
-                tokio::spawn(async move {
+                requests.spawn(async move {
                     let _ = tokio::time::timeout(
                         CONNECTION_TIMEOUT,
                         handle_connection(stream, chain),
@@ -1047,13 +1246,57 @@ async fn api_server(chain: Arc<Chain>, listener: TcpListener, mut shutdown: watc
             }
         }
     }
+    let grace = async { while requests.join_next().await.is_some() {} };
+    if tokio::time::timeout(Duration::from_secs(20), grace)
+        .await
+        .is_err()
+    {
+        requests.abort_all();
+        while requests.join_next().await.is_some() {}
+    }
 }
 
 /// HTTP/1.1 요청 하나를 읽어 라우팅하고 응답을 쓴다.
 async fn handle_connection(mut stream: TcpStream, chain: Arc<Chain>) -> Result<()> {
-    let (status, body) = match read_request(&mut stream).await {
-        Ok((method, path, query, body)) => {
-            route(&chain, &method, &path, query.as_deref(), &body).await
+    // Keep large response buffers bounded even when clients read very slowly.
+    static LARGE_RESPONSES: Semaphore = Semaphore::const_new(2);
+    let mut response_permit = None;
+    let (status, body) = match http::read_request(&mut stream).await {
+        Ok(request) => {
+            let large_read = request.method == "GET"
+                && !matches!(
+                    request.path.as_str(),
+                    "/health" | "/ready" | "/status" | "/network/info"
+                );
+            if large_read {
+                response_permit = LARGE_RESPONSES.try_acquire().ok();
+            }
+            if large_read && response_permit.is_none() {
+                (
+                    503,
+                    json_body(
+                        &serde_json::json!({"error":"large response capacity busy; retry shortly"}),
+                    ),
+                )
+            } else if request.method == "POST"
+                && chain.write_token.as_ref().is_some_and(|token| {
+                    request.authorization.as_deref() != Some(&format!("Bearer {token}"))
+                })
+            {
+                (
+                    401,
+                    json_body(&serde_json::json!({"error": "write authorization required"})),
+                )
+            } else {
+                route(
+                    &chain,
+                    &request.method,
+                    &request.path,
+                    request.query.as_deref(),
+                    &request.body,
+                )
+                .await
+            }
         }
         Err(ChainError::TooLarge(m)) => (413, format!(r#"{{"error":"{m}"}}"#)),
         Err(ChainError::Unsupported(m)) => (411, format!(r#"{{"error":"{m}"}}"#)),
@@ -1064,6 +1307,8 @@ async fn handle_connection(mut stream: TcpStream, chain: Arc<Chain>) -> Result<(
         202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
         411 => "Length Required",
@@ -1078,94 +1323,14 @@ async fn handle_connection(mut stream: TcpStream, chain: Arc<Chain>) -> Result<(
          Content-Length: {}\r\n\
          Access-Control-Allow-Origin: *\r\n\
          Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n\
-         Access-Control-Allow-Headers: content-type\r\n\
+         Access-Control-Allow-Headers: content-type, authorization\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
+    drop(response_permit);
     Ok(())
-}
-
-/// 요청 파싱: (메서드, 경로, 쿼리, 바디). 크기 상한으로 메모리를 보호한다.
-async fn read_request(
-    stream: &mut TcpStream,
-) -> Result<(String, String, Option<String>, Vec<u8>)> {
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 8192];
-
-    // 1) 헤더 끝(\r\n\r\n)이 나올 때까지 읽기
-    let header_end = loop {
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            break pos;
-        }
-        if buf.len() > 64 * 1024 {
-            return Err(ChainError::InvalidTx("요청 헤더가 너무 큽니다".into()));
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(ChainError::InvalidTx("요청이 중간에 끊어졌습니다".into()));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    };
-
-    // 2) 요청 라인과 헤더 파싱
-    let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let mut lines = header_text.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_uppercase();
-    let target = parts.next().unwrap_or_default();
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), Some(q.to_string())),
-        None => (target.to_string(), None),
-    };
-
-    let mut content_length = 0usize;
-    let mut expect_continue = false;
-    let mut chunked = false;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            let name = name.trim();
-            let value = value.trim();
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().unwrap_or(0);
-            } else if name.eq_ignore_ascii_case("expect")
-                && value.eq_ignore_ascii_case("100-continue")
-            {
-                expect_continue = true;
-            } else if name.eq_ignore_ascii_case("transfer-encoding")
-                && value.to_ascii_lowercase().contains("chunked")
-            {
-                chunked = true;
-            }
-        }
-    }
-    if chunked {
-        // 청크 인코딩을 조용히 빈 바디로 취급하면 데이터가 유실된다 — 명시적 거부
-        return Err(ChainError::Unsupported(
-            "chunked 전송은 지원하지 않습니다. Content-Length 를 사용하세요".into(),
-        ));
-    }
-    if content_length > MAX_HTTP_REQUEST_BYTES {
-        return Err(ChainError::TooLarge("body too large".into()));
-    }
-    // curl 등은 큰 바디에서 Expect: 100-continue 후 1초를 기다린다 — 즉시 승인
-    if expect_continue {
-        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-    }
-
-    // 3) 바디 읽기 (헤더와 함께 이미 도착한 부분 + 잔여분)
-    let mut body = buf[header_end + 4..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(content_length);
-    Ok((method, path, query, body))
 }
 
 /// 경로 세그먼트의 %XX 퍼센트 인코딩을 해제한다. 잘못된 인코딩이나 비 UTF-8
@@ -1190,16 +1355,10 @@ fn percent_decode(segment: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| segment.to_string())
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// serde_json::Value → 응답 문자열 (직렬화 실패 시 안전한 폴백)
 pub(crate) fn json_body(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| r#"{"error":"internal"}"#.to_string())
+    value.to_string()
 }
 
-/// 라우팅 테이블 — (상태코드, JSON 바디 문자열)을 돌려준다.
 async fn route(
     chain: &Chain,
     method: &str,
@@ -1207,6 +1366,15 @@ async fn route(
     query: Option<&str>,
     body: &[u8],
 ) -> (u16, String) {
+    if method == "POST" && chain.network.config.role == network::Role::Follower {
+        return (
+            403,
+            json_body(&serde_json::json!({
+                "error": "This node is a verifying follower. Submit writes to the authority.",
+                "role": "follower"
+            })),
+        );
+    }
     // 세그먼트 단위 퍼센트 디코딩 — 브라우저/httpx 가 인코딩해 보낸 경로도
     // 저장 시 원문 키와 일치하게 조회된다 (%2F 는 세그먼트 분해 뒤라 안전)
     let segments: Vec<String> = path
@@ -1221,13 +1389,57 @@ async fn route(
         // CORS preflight (웹 프런트엔드 클라이언트용)
         ("OPTIONS", _) => (204, String::new()),
 
-        ("GET", ["health"]) => {
-            (200, json_body(&serde_json::json!({ "ok": true, "network": "tomei-local" })))
+        ("GET", ["health"]) => (
+            200,
+            json_body(
+                &serde_json::json!({ "ok": true, "network": chain.network.chain_id, "role": chain.network.config.role }),
+            ),
+        ),
+
+        ("GET", ["network", "info"]) => {
+            let (state, _) = chain.snapshot().await;
+            match chain.network.info(&state) {
+                Ok(info) => (200, json_body(&serde_json::json!(info))),
+                Err(e) => (500, json_body(&serde_json::json!({"error":e.to_string()}))),
+            }
+        }
+
+        ("GET", ["ready"]) => {
+            let (state, _) = chain.snapshot().await;
+            let sync = chain.network.sync_status.lock().await.clone();
+            let ready = chain.network.config.role == network::Role::Authority
+                || (!sync.halted
+                    && sync
+                        .last_success_ms
+                        .is_some_and(|t| now_millis().saturating_sub(t) < 60_000)
+                    && sync.remote_height.is_some_and(|h| state.height >= h));
+            (
+                if ready { 200 } else { 503 },
+                json_body(&serde_json::json!({"ready": ready, "sync": sync})),
+            )
+        }
+
+        ("GET", ["network", "block", height]) => {
+            let Ok(height) = height.parse::<u64>() else {
+                return (
+                    400,
+                    json_body(&serde_json::json!({"error":"invalid block height"})),
+                );
+            };
+            match chain.network.signed_block(&chain.store, height) {
+                Ok(Some(block)) => (200, json_body(&serde_json::json!(block))),
+                Ok(None) => (
+                    404,
+                    json_body(&serde_json::json!({"error":"signed block not available"})),
+                ),
+                Err(e) => (500, json_body(&serde_json::json!({"error":e.to_string()}))),
+            }
         }
 
         ("GET", ["status"]) => {
             let (state, pending) = chain.snapshot().await;
             let mantis = chain.mantis_head.lock().await.clone();
+            let sync = chain.network.sync_status.lock().await.clone();
             (
                 200,
                 json_body(&serde_json::json!({
@@ -1237,6 +1449,13 @@ async fn route(
                     "mempool_pending": pending,
                     "mantis_len": mantis.0,
                     "mantis_head": mantis.1,
+                    "role": chain.network.config.role,
+                    "chain_id": chain.network.chain_id,
+                    "authority_public_key": chain.network.authority_public_key,
+                    "consensus": "single-authority",
+                    "replication": "signed-fast-forward",
+                    "sync": sync,
+                    "mantis_replication": false,
                 })),
             )
         }
@@ -1251,14 +1470,19 @@ async fn route(
                     )
                 }
             };
-            match chain.submit_tx(req.namespace, req.payload, req.signature, req.tags).await {
+            match chain
+                .submit_tx(req.namespace, req.payload, req.signature, req.tags)
+                .await
+            {
                 Ok((id, outcome)) => match outcome {
-                    SubmitOutcome::Queued => {
-                        (202, json_body(&serde_json::json!({ "id": id, "status": "queued" })))
-                    }
-                    SubmitOutcome::AlreadyPending => {
-                        (202, json_body(&serde_json::json!({ "id": id, "status": "pending" })))
-                    }
+                    SubmitOutcome::Queued => (
+                        202,
+                        json_body(&serde_json::json!({ "id": id, "status": "queued" })),
+                    ),
+                    SubmitOutcome::AlreadyPending => (
+                        202,
+                        json_body(&serde_json::json!({ "id": id, "status": "pending" })),
+                    ),
                     SubmitOutcome::AlreadyCommitted { height } => (
                         200,
                         json_body(&serde_json::json!({
@@ -1272,7 +1496,10 @@ async fn route(
                         })),
                     ),
                 },
-                Err(e) => (400, json_body(&serde_json::json!({ "error": e.to_string() }))),
+                Err(e) => (
+                    400,
+                    json_body(&serde_json::json!({ "error": e.to_string() })),
+                ),
             }
         }
 
@@ -1305,10 +1532,16 @@ async fn route(
                     if pending {
                         (200, json_body(&serde_json::json!({ "status": "pending" })))
                     } else {
-                        (404, json_body(&serde_json::json!({ "error": "존재하지 않는 트랜잭션" })))
+                        (
+                            404,
+                            json_body(&serde_json::json!({ "error": "존재하지 않는 트랜잭션" })),
+                        )
                     }
                 }
-                Err(e) => (500, json_body(&serde_json::json!({ "error": e.to_string() }))),
+                Err(e) => (
+                    500,
+                    json_body(&serde_json::json!({ "error": e.to_string() })),
+                ),
             }
         }
 
@@ -1317,9 +1550,15 @@ async fn route(
             match chain.store.get_block(state.height) {
                 Ok(Some(block)) => match serde_json::to_string(&block) {
                     Ok(s) => (200, s),
-                    Err(e) => (500, json_body(&serde_json::json!({ "error": e.to_string() }))),
+                    Err(e) => (
+                        500,
+                        json_body(&serde_json::json!({ "error": e.to_string() })),
+                    ),
                 },
-                _ => (500, json_body(&serde_json::json!({ "error": "최신 블록 조회 실패" }))),
+                _ => (
+                    500,
+                    json_body(&serde_json::json!({ "error": "최신 블록 조회 실패" })),
+                ),
             }
         }
 
@@ -1327,34 +1566,71 @@ async fn route(
             Ok(height) => match chain.store.get_block(height) {
                 Ok(Some(block)) => match serde_json::to_string(&block) {
                     Ok(s) => (200, s),
-                    Err(e) => (500, json_body(&serde_json::json!({ "error": e.to_string() }))),
+                    Err(e) => (
+                        500,
+                        json_body(&serde_json::json!({ "error": e.to_string() })),
+                    ),
                 },
-                Ok(None) => {
-                    (404, json_body(&serde_json::json!({ "error": "존재하지 않는 블록 높이" })))
-                }
-                Err(e) => (500, json_body(&serde_json::json!({ "error": e.to_string() }))),
+                Ok(None) => (
+                    404,
+                    json_body(&serde_json::json!({ "error": "존재하지 않는 블록 높이" })),
+                ),
+                Err(e) => (
+                    500,
+                    json_body(&serde_json::json!({ "error": e.to_string() })),
+                ),
             },
-            Err(_) => {
-                (400, json_body(&serde_json::json!({ "error": "블록 높이는 정수여야 합니다" })))
-            }
+            Err(_) => (
+                400,
+                json_body(&serde_json::json!({ "error": "블록 높이는 정수여야 합니다" })),
+            ),
         },
 
         ("GET", ["ns", ns]) => match chain.store.namespace_info(ns) {
-            Ok(Some(info)) => (200, json_body(&serde_json::to_value(&info).unwrap_or_default())),
-            Ok(None) => {
-                (404, json_body(&serde_json::json!({ "error": "기록이 없는 네임스페이스" })))
-            }
-            Err(e) => (500, json_body(&serde_json::json!({ "error": e.to_string() }))),
+            Ok(Some(info)) => (
+                200,
+                json_body(&serde_json::to_value(&info).unwrap_or_default()),
+            ),
+            Ok(None) => (
+                404,
+                json_body(&serde_json::json!({ "error": "기록이 없는 네임스페이스" })),
+            ),
+            Err(e) => (
+                500,
+                json_body(&serde_json::json!({ "error": e.to_string() })),
+            ),
         },
 
         ("GET", ["verify"]) => {
+            let Ok(permit) = Arc::clone(&chain.verify_gate).try_acquire_owned() else {
+                return (
+                    503,
+                    json_body(&serde_json::json!({"error":"verification already running"})),
+                );
+            };
             let (state, _) = chain.snapshot().await;
-            match chain.store.verify_chain(0, state.height) {
-                Ok(report) => {
+            let store = chain.store.clone();
+            match tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                store.verify_chain(0, state.height)
+            })
+            .await
+            {
+                Ok(Ok(report)) => {
                     let code = if report.ok { 200 } else { 500 };
-                    (code, json_body(&serde_json::to_value(&report).unwrap_or_default()))
+                    (
+                        code,
+                        json_body(&serde_json::to_value(&report).unwrap_or_default()),
+                    )
                 }
-                Err(e) => (500, json_body(&serde_json::json!({ "error": e.to_string() }))),
+                Ok(Err(e)) => (
+                    500,
+                    json_body(&serde_json::json!({ "error": e.to_string() })),
+                ),
+                Err(e) => (
+                    500,
+                    json_body(&serde_json::json!({ "error": e.to_string() })),
+                ),
             }
         }
 
@@ -1364,11 +1640,24 @@ async fn route(
         ("GET", ["wallet"]) => heartcritique::wallet(chain),
 
         // ── mantis-cad 어댑터 (mantis-server 드롭인) ─────────────────────────
+        ("GET", ["api", "info" | "blocks"])
+            if chain.network.config.role == network::Role::Follower =>
+        {
+            (
+                503,
+                json_body(
+                    &serde_json::json!({"error":"Mantis raw history is not replicated. Use the authority Mantis endpoint."}),
+                ),
+            )
+        }
         ("GET", ["api", "info"]) => mantis::info(chain).await,
         ("GET", ["api", "blocks"]) => mantis::get_blocks(chain, query).await,
         ("POST", ["api", "blocks"]) => mantis::post_blocks(chain, body).await,
 
-        _ => (404, json_body(&serde_json::json!({ "error": "알 수 없는 엔드포인트" }))),
+        _ => (
+            404,
+            json_body(&serde_json::json!({ "error": "알 수 없는 엔드포인트" })),
+        ),
     }
 }
 
@@ -1416,7 +1705,9 @@ async fn run_demo(chain: &Arc<Chain>) -> Result<()> {
 
     let mut ids = Vec::new();
     for (ns, payload) in samples {
-        let (id, _) = chain.submit_tx(ns.to_string(), payload, None, Vec::new()).await?;
+        let (id, _) = chain
+            .submit_tx(ns.to_string(), payload, None, Vec::new())
+            .await?;
         log_line(&format!("  트랜잭션 제출: {ns} → {}…", &id[..16]));
         ids.push(id);
     }
@@ -1462,8 +1753,25 @@ pub(crate) fn log_line(msg: &str) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::from_env();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        println!("tomei-chain {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args == ["--help"] || args == ["-h"] {
+        println!("tomei-chain {}\nUsage: tomei-chain [--demo | --version | --help]\n\nConfiguration: TOMEI_NODE_ROLE=authority|follower, TOMEI_DATA_DIR, TOMEI_ADDR.\nFollowers require TOMEI_PEERS and a trusted TOMEI_AUTHORITY_PUBLIC_KEY.\nSee README.md for Docker setup, network identity and operating instructions.", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg != "--demo") {
+        return Err(ChainError::InvalidTx("unknown argument; use --help".into()));
+    }
+    let config = Config::from_env()?;
     let demo_mode = std::env::args().any(|a| a == "--demo");
+    if demo_mode && config.network.role == network::Role::Follower {
+        return Err(ChainError::InvalidTx(
+            "--demo requires authority mode".into(),
+        ));
+    }
 
     log_line(&format!("데이터 디렉토리: {}", config.data_dir));
 
@@ -1478,26 +1786,44 @@ async fn main() -> Result<()> {
                 &state.tip_hash[..16]
             ));
         } else {
-            log_line(&format!("제네시스 블록 생성 — 팁 {}…", &state.tip_hash[..16]));
+            log_line(&format!(
+                "제네시스 블록 생성 — 팁 {}…",
+                &state.tip_hash[..16]
+            ));
         }
         let mantis = chain.mantis_head.lock().await.clone();
-        log_line(&format!("mantis 체인 — 블록 {}개, 헤드 {}…", mantis.0, &mantis.1[..16]));
+        log_line(&format!(
+            "mantis 체인 — 블록 {}개, 헤드 {}…",
+            mantis.0,
+            &mantis.1[..16]
+        ));
     }
 
     // 2) 종료 신호 채널 (Ctrl-C → 모든 루프에 전파)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // 3) 블록 생산 루프 기동
-    let producer = tokio::spawn(block_producer(
-        Arc::clone(&chain),
-        config.block_interval,
-        shutdown_rx.clone(),
-    ));
+    let producer = if config.network.role == network::Role::Authority {
+        tokio::spawn(block_producer(
+            Arc::clone(&chain),
+            config.block_interval,
+            shutdown_rx.clone(),
+        ))
+    } else {
+        tokio::spawn(network::run_follower(
+            Arc::clone(&chain),
+            shutdown_rx.clone(),
+        ))
+    };
 
     // 4) HTTP API 서버 기동 (메인 포트 + mantis-cad 기본 포트 겸용 리스너)
     let listener = TcpListener::bind(config.api_addr).await?;
     log_line(&format!("HTTP API 대기 중: http://{}", config.api_addr));
-    let api = tokio::spawn(api_server(Arc::clone(&chain), listener, shutdown_rx.clone()));
+    let api = tokio::spawn(api_server(
+        Arc::clone(&chain),
+        listener,
+        shutdown_rx.clone(),
+    ));
 
     let mut mantis_api = None;
     if let Some(addr) = config.mantis_addr {
@@ -1520,7 +1846,7 @@ async fn main() -> Result<()> {
     } else {
         // 데몬: Ctrl-C(SIGINT)까지 상주
         log_line("데몬 모드로 상주합니다. 종료: Ctrl-C");
-        tokio::signal::ctrl_c().await?;
+        wait_shutdown_signal().await?;
         log_line("종료 신호 수신 — 우아한 종료를 시작합니다");
         let _ = shutdown_tx.send(true);
     }
@@ -1528,16 +1854,29 @@ async fn main() -> Result<()> {
     // 5) 우아한 종료: 생산 루프(잔여 트랜잭션 커밋 포함) → API 중단 →
     //    API 중단 직전에 접수된 낙오 트랜잭션까지 밀봉 → 최종 flush
     let _ = producer.await;
-    api.abort(); // accept 대기는 즉시 중단해도 안전
+    let _ = api.await;
     if let Some(m) = mantis_api {
-        m.abort();
+        let _ = m.await;
     }
     // 진행 중이던 커넥션이 마무리할 짧은 유예 후, 낙오분을 마지막으로 밀봉
-    tokio::time::sleep(Duration::from_millis(200)).await;
     drain_mempool_fully(&chain, "종료 후").await;
     chain.store.flush().await?;
     log_line("모든 데이터가 디스크에 동기화되었습니다. 안녕히!");
     Ok(())
+}
+
+async fn wait_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 // ============================================================================
@@ -1568,6 +1907,7 @@ mod tests {
     }
 
     pub(crate) fn test_config(data_dir: String) -> Config {
+        let network = network::NetworkConfig::test_authority(&data_dir);
         Config {
             data_dir,
             api_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1575,6 +1915,8 @@ mod tests {
             public_url: "http://127.0.0.1:8642".to_string(),
             block_interval: Duration::from_millis(50),
             batch_threshold: 100,
+            network,
+            write_token: None,
         }
     }
 
@@ -1592,7 +1934,10 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         // 필드 경계 조작이 다른 ID를 만드는지 (구분자 검증)
-        assert_ne!(compute_tx_id("ab", "c", 1, &[]), compute_tx_id("a", "bc", 1, &[]));
+        assert_ne!(
+            compute_tx_id("ab", "c", 1, &[]),
+            compute_tx_id("a", "bc", 1, &[])
+        );
         // 태그도 ID에 반영
         let tagged = compute_tx_id("ns", "payload", 42, &[("k".into(), "v".into())]);
         assert_ne!(a, tagged);
@@ -1653,7 +1998,10 @@ mod tests {
 
     #[test]
     fn 제네시스는_결정적이다() {
-        assert_eq!(Block::genesis().unwrap().hash, Block::genesis().unwrap().hash);
+        assert_eq!(
+            Block::genesis().unwrap().hash,
+            Block::genesis().unwrap().hash
+        );
     }
 
     #[test]
@@ -1672,11 +2020,17 @@ mod tests {
         )
         .unwrap();
         let block = Block::new(1, state.tip_hash.clone(), vec![tx.clone()]).unwrap();
-        let new_state =
-            BlockchainState { height: 1, tip_hash: block.hash.clone(), total_txs: 1 };
+        let new_state = BlockchainState {
+            height: 1,
+            tip_hash: block.hash.clone(),
+            total_txs: 1,
+        };
         store.commit_block(&block, &new_state).unwrap();
         assert_eq!(store.tx_height(&tx.id).unwrap(), Some(1));
-        assert_eq!(store.tag_lookup("story", "s1").unwrap(), Some(tx.id.clone()));
+        assert_eq!(
+            store.tag_lookup("story", "s1").unwrap(),
+            Some(tx.id.clone())
+        );
         let ns = store.namespace_info("ns").unwrap().unwrap();
         assert_eq!(ns.count, 1);
         assert_eq!(ns.last_height, 1);
@@ -1693,10 +2047,17 @@ mod tests {
         store
             .commit_block(
                 &block2,
-                &BlockchainState { height: 2, tip_hash: block2.hash.clone(), total_txs: 2 },
+                &BlockchainState {
+                    height: 2,
+                    tip_hash: block2.hash.clone(),
+                    total_txs: 2,
+                },
             )
             .unwrap();
-        assert_eq!(store.tag_lookup("story", "s1").unwrap(), Some(tx.id.clone()));
+        assert_eq!(
+            store.tag_lookup("story", "s1").unwrap(),
+            Some(tx.id.clone())
+        );
 
         // 재시작 시뮬레이션: 같은 경로로 다시 열어 상태 복원
         drop(store);
@@ -1719,7 +2080,11 @@ mod tests {
         store
             .commit_block(
                 &b1,
-                &BlockchainState { height: 1, tip_hash: b1.hash.clone(), total_txs: 1 },
+                &BlockchainState {
+                    height: 1,
+                    tip_hash: b1.hash.clone(),
+                    total_txs: 1,
+                },
             )
             .unwrap();
         // 잘못된 prev_hash 로 연결된 블록 커밋 (검증이 잡아내야 함)
@@ -1728,7 +2093,11 @@ mod tests {
         store
             .commit_block(
                 &bad,
-                &BlockchainState { height: 2, tip_hash: bad.hash.clone(), total_txs: 2 },
+                &BlockchainState {
+                    height: 2,
+                    tip_hash: bad.hash.clone(),
+                    total_txs: 2,
+                },
             )
             .unwrap();
         let report = store.verify_chain(0, 2).unwrap();
@@ -1743,16 +2112,29 @@ mod tests {
         let (chain, dir) = test_chain();
 
         let (id, outcome) = chain
-            .submit_tx("mantis-cad".into(), "file_hash:abc".into(), None, Vec::new())
+            .submit_tx(
+                "mantis-cad".into(),
+                "file_hash:abc".into(),
+                None,
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert!(matches!(outcome, SubmitOutcome::Queued));
         // 같은 내용 재제출 → 멱등 처리 (같은 밀리초면 AlreadyPending, 아니면 Queued)
         let (_, outcome2) = chain
-            .submit_tx("mantis-cad".into(), "file_hash:abc".into(), None, Vec::new())
+            .submit_tx(
+                "mantis-cad".into(),
+                "file_hash:abc".into(),
+                None,
+                Vec::new(),
+            )
             .await
             .unwrap();
-        assert!(matches!(outcome2, SubmitOutcome::AlreadyPending | SubmitOutcome::Queued));
+        assert!(matches!(
+            outcome2,
+            SubmitOutcome::AlreadyPending | SubmitOutcome::Queued
+        ));
 
         let sealed = chain.seal_pending_block().await.unwrap().unwrap();
         assert_eq!(sealed.header.index, 1);

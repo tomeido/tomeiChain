@@ -1,0 +1,11 @@
+# Caddy가 노드와 같은 호스트 프로세스로 실행될 때의 예제입니다.
+# node.example.com을 본인 도메인으로 바꾸고 DNS를 연결하세요.
+node.example.com {
+    @read method GET OPTIONS
+    handle @read {
+        reverse_proxy 127.0.0.1:8642
+    }
+    handle {
+        respond "This public endpoint is read-only." 403
+    }
+}
