@@ -3,4 +3,6 @@
 !Cargo.lock
 !src/
 !src/**
+!explorer/
+!explorer/**
 !Dockerfile

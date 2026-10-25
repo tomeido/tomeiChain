@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0c101b">
+  <meta name="description" content="tomeiChain의 블록, 트랜잭션, 공증 기록과 네트워크 상태를 살펴보세요.">
+  <title>tomei Explorer · 기록을 확인하는 곳</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='17' fill='%238f9fff'/%3E%3Cpath d='M17 23h30M32 13v29q0 9 12 6' fill='none' stroke='%230c101b' stroke-width='7'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./styles.css">
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">본문으로 건너뛰기</a>
+  <aside class="sidebar">
+    <a class="brand" href="#/" aria-label="tomei Explorer 홈"><span class="brand-icon">t</span><span>tomei<span class="brand-sub">EXPLORER</span></span></a>
+    <div class="sidebar-label">WORKSPACE</div>
+    <nav aria-label="주 메뉴">
+      <a href="#/" data-nav="home"><span data-icon="grid"></span>대시보드</a>
+      <a href="#/blocks" data-nav="blocks"><span data-icon="box"></span>블록</a>
+      <a href="#/transactions" data-nav="transactions"><span data-icon="arrows"></span>트랜잭션</a>
+      <a href="#/namespaces" data-nav="namespaces"><span data-icon="layers"></span>네임스페이스</a>
+      <a href="#/network" data-nav="network"><span data-icon="network"></span>네트워크</a>
+    </nav>
+    <div class="sidebar-bottom"><div class="network-label"><span class="status-dot"></span>tomei 실험망</div><p>데이터를 기록하고,<br>누구나 확인할 수 있도록.</p><a href="https://github.com/tomeido/tomeiChain" target="_blank" rel="noopener noreferrer">프로젝트 살펴보기 <span aria-hidden="true">↗</span></a></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="breadcrumbs">탐색기 <span>/</span> <strong id="breadcrumb">대시보드</strong></div><div class="topbar-right"><span class="network-pill">실험망</span><span id="connection" class="connection" role="status"><i class="status-dot pending"></i>연결 중</span><button class="icon-button" id="refresh" aria-label="새로고침" title="새로고침"><span data-icon="refresh"></span></button></div></header>
+    <main id="main" tabindex="-1">
+      <section class="hero"><div class="eyebrow"><span></span> THE TOMEI CHAIN EXPLORER</div><h1>모든 기록, 투명하게.</h1><p>tomei 체인에 새겨진 블록과 공증 기록을 확인하세요.</p><form id="search-form" class="search-form" role="search"><span data-icon="search"></span><label class="sr-only" for="search-input">블록 높이, 블록 해시, 트랜잭션 ID 또는 네임스페이스 검색</label><input id="search-input" name="q" autocomplete="off" spellcheck="false" placeholder="블록 높이, 트랜잭션 · 블록 해시, 네임스페이스 검색" required maxlength="256"><kbd>/</kbd><button type="submit">검색 <span aria-hidden="true">→</span></button></form><div id="search-message" class="search-message" role="status"></div><div class="hero-bottom"><span>독립적으로 보관되는, 검증 가능한 기록</span><span class="hero-code">BLAKE3 <i>·</i> ED25519</span></div></section>
+      <div id="notice" role="status"></div>
+      <div id="view" aria-live="polite"><div class="loading"><span class="spinner"></span>체인 데이터를 불러오고 있습니다.</div></div>
+      <footer><span><strong>tomei</strong> Explorer <i>·</i> 기록에서 시작되는 신뢰</span><span id="updated">공개 노드 연결 중</span></footer>
+    </main>
+  </div>
+  <div id="toast" role="status" class="toast" hidden></div>
+</body>
+</html>

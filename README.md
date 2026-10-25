@@ -72,6 +72,51 @@ TOMEI_PEERS=https://domeido.asuscomm.com/tomei,https://another-operator.example.
 
 follower는 `/tx`, `/upload`, `/api/blocks` 쓰기를 `403`으로 거부합니다. 공증을 새로 제출하는 앱은 authority의 쓰기 경로를 사용해야 합니다. 네트워크 주소에 접두사(`/tomei` 등)가 있어도 피어 URL에 그대로 포함하면 됩니다.
 
+## 블록 탐색기
+
+공개 탐색기: **[tomei Explorer](https://domeido.asuscomm.com/tomei/explorer/)**
+
+각 노드는 `/explorer/`에서 같은 읽기 전용 탐색기를 제공합니다. 로컬 노드는
+`http://127.0.0.1:8642/explorer/`로 열 수 있습니다. HTML·JavaScript·CSS를 Rust
+바이너리에 포함하므로 별도 Node.js 서버, 프런트엔드 빌드 또는 외부 데이터베이스가
+필요하지 않습니다. `/tomei` 같은 reverse proxy 접두사도 지원합니다.
+
+- 최신 블록, 확정 트랜잭션, 대기 건수와 노드 상태를 실제 노드 API에서 조회합니다.
+- 블록 높이·블록 해시·트랜잭션 ID·네임스페이스 이름을 검색할 수 있습니다.
+- 블록과 트랜잭션 상세, 원문 payload, 태그, authority 체크포인트 서명을 확인할 수 있습니다.
+- 목록은 커서로 페이지를 이동하며 네임스페이스별 공증 기록을 조회할 수 있습니다.
+
+블록은 제출할 트랜잭션이 있을 때 생성되므로 마지막 블록이 오래되어도 노드 장애를
+의미하지 않습니다. 화면의 체크포인트 서명 표시는 서명 데이터가 포함되었다는 뜻이며,
+브라우저에서 독립적으로 암호학적 검증을 완료했다는 뜻은 아닙니다. 일반 트랜잭션의
+`signature`는 앱 데이터입니다. 이 네트워크에는 토큰 잔액·가스비·PoS 검증자 지표가 없습니다.
+
+탐색기 API는 다음과 같습니다. `limit`은 `1..100`이며 기본값은 `20`입니다.
+
+| 요청 | 설명 |
+|---|---|
+| `GET /explorer/api/blocks?before=H&limit=20` | 최신순 블록 요약. `before` 높이는 제외 |
+| `GET /explorer/api/transactions?cursor=H:I&limit=20` | 최신순 확정 트랜잭션 요약. `namespace`로 필터 가능 |
+| `GET /explorer/api/namespaces?cursor=NAME&limit=20` | 이름순 네임스페이스와 누적 공증 건수 |
+| `GET /explorer/api/search?q=VALUE` | 블록 높이·해시, 트랜잭션 ID 또는 정확한 네임스페이스 이름 검색 |
+
+목록 응답은 `{items, total, next_cursor}` 형식이며 마지막 페이지는
+`next_cursor: null`입니다. 커서는 반환된 값을 URL 인코딩해 그대로 사용하세요.
+목록에는 대용량 payload 대신 크기 등 요약만 포함합니다. 기존 `/block/{height}`,
+`/tx/{id}`, `/network/block/{height}` API에서 원문과 서명을 조회할 수 있습니다.
+탐색기 인덱스는 기존 sled 저장소에서 블록을 읽어 점진적으로 생성합니다. 밀린 블록이
+많으면 일시적으로 `503`을 반환할 수 있으며 클라이언트는 잠시 후 재시도해야 합니다.
+탐색기는 체인 기록을 수정하거나 새 트랜잭션을 제출하지 않습니다.
+
+프런트엔드를 수정하면 바이너리를 다시 빌드하고 노드를 재시작합니다. Docker는
+`docker compose up -d --build`로 갱신합니다. systemd는 `./build.sh` 완료 후
+`systemctl --user restart tomei-chain`으로 갱신할 수 있습니다. 운영 환경을 변경하기
+전에 임시 체인을 사용하는 다음 검사를 실행하세요.
+
+```bash
+python3 scripts/smoke-explorer.py --binary target/release/tomei-chain
+```
+
 ## 새 독립 체인 만들기
 
 새 authority를 만드는 것은 공개 체인에 검증자로 참가하는 동작이 아닙니다. **별도의 키와 체인을 생성**합니다. 기존 follower와 분리된 Compose 프로젝트·볼륨을 사용하세요.

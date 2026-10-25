@@ -3,6 +3,7 @@ FROM ${RUST_IMAGE} AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY explorer ./explorer
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

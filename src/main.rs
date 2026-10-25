@@ -23,6 +23,7 @@
 //!   [5] 스토리지    [6] 멤풀          [7] 체인 코어     [8] 블록 생산 루프
 //!   [9] HTTP API    [10] 데모         [11] main         [12] 테스트
 
+mod explorer;
 mod heartcritique;
 mod http;
 mod mantis;
@@ -455,6 +456,7 @@ pub(crate) struct Store {
     state: sled::Tree,
     signatures: sled::Tree,
     pub(crate) mantis_blocks: sled::Tree,
+    explorer: explorer::Index,
 }
 
 /// 체인 검증 결과 리포트
@@ -480,12 +482,14 @@ impl Store {
         let state = db.open_tree("state")?;
         let mantis_blocks = db.open_tree("mantis_blocks")?;
         let signatures = db.open_tree("network_signatures")?;
+        let explorer = explorer::Index::open(&db)?;
         Ok(Store {
             db,
             blocks,
             state,
             mantis_blocks,
             signatures,
+            explorer,
         })
     }
 
@@ -1263,6 +1267,9 @@ async fn handle_connection(mut stream: TcpStream, chain: Arc<Chain>) -> Result<(
     let mut response_permit = None;
     let (status, body) = match http::read_request(&mut stream).await {
         Ok(request) => {
+            if explorer::serve_asset(&mut stream, &request.method, &request.path).await? {
+                return Ok(());
+            }
             let large_read = request.method == "GET"
                 && !matches!(
                     request.path.as_str(),
@@ -1310,6 +1317,7 @@ async fn handle_connection(mut stream: TcpStream, chain: Arc<Chain>) -> Result<(
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
@@ -1366,6 +1374,9 @@ async fn route(
     query: Option<&str>,
     body: &[u8],
 ) -> (u16, String) {
+    if path.starts_with("/explorer/api/") {
+        return explorer::route(chain, method, path, query).await;
+    }
     if method == "POST" && chain.network.config.role == network::Role::Follower {
         return (
             403,
